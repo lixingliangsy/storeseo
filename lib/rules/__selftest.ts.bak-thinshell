@@ -1,0 +1,70 @@
+/**
+ * Deterministic self-test for the storeseo rule engine (no LLM).
+ * Run: tsx lib/rules/__selftest.ts
+ *
+ * Exercises the e-commerce product-listing SEO rules in ./storeseo and asserts
+ * that:
+ *  - the ruleset version is date-stamped (§3 requirement)
+ *  - a complete SEO pack passes the core rules
+ *  - a thin pack fails the expected rules
+ * Exit code is non-zero if any assertion fails.
+ */
+import { runAllRules, RULESET_VERSION } from './storeseo'
+import type { RuleResult } from '../schema'
+
+let pass = 0
+let fail = 0
+function assert(name: string, cond: boolean) {
+  if (cond) {
+    pass++
+    console.log('  PASS ' + name)
+  } else {
+    fail++
+    console.error('  FAIL ' + name)
+  }
+}
+
+function byId(results: RuleResult[]): Record<string, RuleResult> {
+  const map: Record<string, RuleResult> = {}
+  for (const r of results) map[r.ruleId] = r
+  return map
+}
+
+console.log('storeseo selftest')
+
+// 1) Ruleset version is date-stamped (§3).
+assert('ruleset version is date-stamped', /^\d{4}-\d{2}-\d{2}\./.test(RULESET_VERSION))
+
+// 2) A complete SEO pack passes core rules.
+const goodPack = `TITLE: Waterproof Trail Running Shoes for Men - Lightweight Grip
+DESC: Our waterproof trail running shoes for men keep your feet dry on any terrain. Lightweight build, aggressive grip, and all-day comfort for serious runners who train in the rain.
+ALT:
+1) Man wearing waterproof trail running shoes on a muddy path
+2) Close-up of the rubber outsole grip
+3) Side view of the lightweight mesh upper
+4) Water beading off the shoe surface
+5) Trail running shoes on a wet rock
+
+SCHEMA: {"@context":"https://schema.org","@type":"Product","name":"Waterproof Trail Running Shoes","description":"Lightweight waterproof trail shoe","brand":{"@name":"TrailPro"},"gtin":"1234567890123","offers":{"@type":"Offer","price":"89.00","availability":"https://schema.org/InStock"}}
+In stock. Free shipping on orders over $50. Delivery time 3-5 days.`
+
+const goodResults = byId(runAllRules(goodPack, { keyword: 'trail running shoes' }))
+assert('good: title length passes (EC-A01)', goodResults['EC-A01']?.passed === true)
+assert('good: description length passes (EC-A02)', goodResults['EC-A02']?.passed === true)
+assert('good: 5 alt texts pass (EC-A04)', goodResults['EC-A04']?.passed === true)
+assert('good: product schema passes (EC-A05)', goodResults['EC-A05']?.passed === true)
+assert('good: price+availability passes (EC-A06)', goodResults['EC-A06']?.passed === true)
+assert('good: identifier passes (EC-A09)', goodResults['EC-A09']?.passed === true)
+
+// 3) A thin pack fails the expected rules.
+const badPack = `TITLE: Home
+DESC: Product.
+ALT: none`
+
+const badResults = byId(runAllRules(badPack, { keyword: 'shoes' }))
+assert('bad: generic title fails (EC-A07)', badResults['EC-A07']?.passed === false)
+assert('bad: missing alt fails (EC-A04)', badResults['EC-A04']?.passed === false)
+assert('bad: missing schema fails (EC-A05)', badResults['EC-A05']?.passed === false)
+
+console.log(`\nSELFTEST ${fail === 0 ? 'ALL PASS' : 'HAS FAILURES'} — pass=${pass} fail=${fail}`)
+if (fail > 0) process.exit(1)

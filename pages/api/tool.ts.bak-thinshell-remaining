@@ -1,0 +1,259 @@
+import type { NextApiRequest, NextApiResponse } from 'next'
+import { PRODUCT } from '../../lib/product'
+import { AI_QUOTAS, checkAndConsumeQuota, defaultModel, resolvePlan } from '../../lib/aiGateway'
+import { getByokKey } from '../../lib/byokStore'
+import {
+  createRun,
+  loadRun,
+  saveRun,
+  nextStep,
+  StepId,
+  RunState,
+} from '../../lib/pipeline'
+import { writeAudit } from '../../lib/auditLog'
+import { runAllRules, RULESET_VERSION } from '../../lib/rules/storeseo'
+import { STEP_IDS, isValidStep } from '../../lib/schema'
+
+/**
+ * Per-step guidance appended to the model prompt so the same product prompt
+ * produces genuinely different work at each stage of the pipeline.
+ */
+const STEP_INSTRUCTIONS: Record<StepId, string> = {
+  parse:
+    'STEP 1/3 — PARSE: From the product page text and primary keyword, extract the core product attributes ' +
+    '(name, category, 3-5 key features, price if present, target audience). Output a short structured summary.',
+  generate:
+    'STEP 2/3 — GENERATE: Write the SEO pack. Use exactly this structure:\n' +
+    'TITLE: <meta title, <=60 chars>\n' +
+    'DESC: <meta description, <=155 chars>\n' +
+    'ALT: 1) ... 2) ... 3) ... 4) ... 5) ... <five alt-text suggestions>\n' +
+    'SCHEMA: <a schema.org/Product-ready blurb>\n' +
+    'Respect keyword guardrails: use the keyword once or twice, never stuff.',
+  review:
+    'STEP 3/3 — REVIEW: Re-emit the final SEO pack in the same TITLE/DESC/ALT/SCHEMA structure, ' +
+    'then validate it: confirm title <=60, description <=155, 5 alt texts, schema.org/Product blurb, ' +
+    'keyword not stuffed, price/availability present. End with a one-line verdict.',
+}
+
+export default async function handler(req: NextApiRequest, res: NextApiResponse) {
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' })
+
+  let inputs: Record<string, string> = {}
+  let runId: string = ''
+  let currentStep: StepId = 'parse'
+  let source: 'rule-based' | 'model-assisted' = 'model-assisted'
+
+  try {
+    const body = (req.body || {}) as {
+      inputs?: Record<string, string>
+      useMock?: boolean
+      runId?: string
+      step?: StepId
+      action?: 'advance' | 'confirm'
+      useByok?: boolean
+      plan?: 'free' | 'pro' | 'enterprise'
+    }
+    inputs = body.inputs || {}
+    const useMock = !!body.useMock
+    runId = body.runId || ''
+    currentStep = body.step || 'parse'
+    const action = body.action || 'advance'
+
+    if (!isValidStep(currentStep)) {
+      return res.status(400).json({
+        error: 'Invalid step: must be ' + STEP_IDS.join(' / '),
+        code: 'INVALID_STEP',
+      })
+    }
+
+    // Trust boundary: plan is resolved server-side only (env override or signed entitlement).
+    const plan = resolvePlan(req)
+    const slug = String((PRODUCT as any).slug || 'product')
+
+    // BYOK skip platform quota ONLY when server plan is enterprise AND key is stored.
+    const wantByok = plan === 'enterprise'
+    const byokKey = wantByok ? getByokKey(slug) : null
+    const usingByok = !!byokKey
+    const platformKey = process.env.OPENAI_API_KEY || ''
+    const apiKey = byokKey || platformKey
+    const hasKey = !!apiKey
+
+    const model = process.env.OPENAI_MODEL || defaultModel()
+
+    // ---- Explicit Demo mode (user opted in) ----
+    if (useMock) {
+      if (!runId) {
+        const run = createRun(inputs)
+        runId = run.runId
+        saveRun(run)
+      }
+      const mockFn = typeof (PRODUCT as any).mock === 'function' ? (PRODUCT as any).mock : null
+      const result = mockFn ? String(mockFn(inputs)) : 'Demo mode — not live AI'
+
+      writeAudit({
+        timestamp: new Date().toISOString(),
+        runId,
+        step: currentStep,
+        action: 'mock',
+        model: 'demo',
+        source: 'rule-based',
+      })
+
+      return res.status(200).json({ result, runId, demo: true, mock: true, step: currentStep })
+    }
+
+    // ---- No key and not demo → hard 503, never a fake result ----
+    if (!hasKey) {
+      return res.status(503).json({
+        error: 'AI is not configured. Add OPENAI_API_KEY or enable Demo mode.',
+        code: 'AI_NOT_CONFIGURED',
+        demo: false,
+        degraded: true,
+        configured: false,
+      })
+    }
+
+    // ---- Fair Use quota gate (real boolean field) ----
+    const quotaCheck = checkAndConsumeQuota(slug, plan)
+    if (!quotaCheck.ok) {
+      writeAudit({
+        timestamp: new Date().toISOString(),
+        runId,
+        step: currentStep,
+        action: 'quota_check',
+        quota: {
+          plan: quotaCheck.plan,
+          daily: quotaCheck.daily,
+          monthly: quotaCheck.monthly,
+          limit: quotaCheck.dailyLimit,
+        },
+        source: 'rule-based',
+      })
+      return res.status(429).json({
+        error: 'Fair use limit reached. Upgrade or wait for reset.',
+        code: 'QUOTA_EXCEEDED',
+        demo: false,
+      })
+    }
+
+    // ---- Load or create the run, enforcing step order ----
+    let run: RunState
+    if (runId) {
+      const existing = loadRun(runId)
+      if (!existing) {
+        return res.status(404).json({ error: 'Run not found', code: 'RUN_NOT_FOUND' })
+      }
+      run = existing
+    } else {
+      run = createRun(inputs)
+      runId = run.runId
+      saveRun(run)
+    }
+
+    if (currentStep !== run.step) {
+      return res.status(400).json({
+        error: 'Invalid step transition: expected ' + run.step + ', received ' + currentStep,
+        code: 'INVALID_STEP',
+      })
+    }
+
+    writeAudit({
+      timestamp: new Date().toISOString(),
+      runId,
+      step: currentStep,
+      action: 'start',
+      model,
+      source: 'model-assisted',
+    })
+
+    const inputText =
+      PRODUCT.inputs
+        .map((f) => `${f.label}: ${inputs[f.key] || '(not provided)'}`)
+        .join('\n') +
+      '\n\n' + STEP_INSTRUCTIONS[currentStep]
+
+    const r = await fetch(`${process.env.OPENAI_BASE_URL || 'https://integrate.api.nvidia.com/v1'}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        messages: [
+          { role: 'system', content: PRODUCT.systemPrompt },
+          { role: 'user', content: inputText },
+        ],
+        temperature: 0.7,
+      }),
+    })
+
+    if (!r.ok) {
+      const t = await r.text()
+      throw new Error('AI request failed: ' + t.slice(0, 160))
+    }
+    const data = await r.json()
+    const text = data.choices?.[0]?.message?.content || ''
+    if (!text.trim()) throw new Error('Empty AI response')
+
+    // Advance pipeline state, storing the artifact for the step we just ran.
+    let nextRun: RunState
+    try {
+      nextRun = nextStep(run, action)
+      nextRun.artifacts[currentStep] = text
+      saveRun(nextRun)
+    } catch (e: any) {
+      nextRun = { ...run, status: 'done' as const }
+      saveRun(nextRun)
+    }
+
+    // Deterministic vertical rules run at the final step (no LLM dependency).
+    const isFinalStep = STEP_IDS[STEP_IDS.length - 1] === currentStep
+    let rulesetVersion: string | undefined
+    let ruleResults: unknown[] | undefined
+    if (isFinalStep) {
+      rulesetVersion = RULESET_VERSION
+      ruleResults = runAllRules(text, { keyword: inputs['keyword'] || '' })
+    }
+
+    writeAudit({
+      timestamp: new Date().toISOString(),
+      runId,
+      step: currentStep,
+      action: 'complete',
+      model,
+      source: 'model-assisted',
+    })
+
+    return res.status(200).json({
+      result: text,
+      runId,
+      step: nextRun.step,
+      status: nextRun.status,
+      demo: false,
+      mock: false,
+      model,
+      source: 'Model-assisted',
+      ...(rulesetVersion ? { rulesetVersion } : {}),
+      ...(ruleResults ? { ruleResults } : {}),
+    })
+  } catch (e: any) {
+    writeAudit({
+      timestamp: new Date().toISOString(),
+      runId,
+      step: currentStep,
+      action: 'error',
+      error: e?.message || 'unknown error',
+      source: 'model-assisted',
+    })
+
+    return res.status(502).json({
+      error: 'AI service call failed: ' + (e?.message || 'unknown error'),
+      code: 'AI_UPSTREAM_FAILED',
+      degraded: true,
+      demo: false,
+      mock: false,
+      runId,
+    })
+  }
+}

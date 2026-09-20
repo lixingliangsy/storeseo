@@ -1,0 +1,46 @@
+# StoreSEO - llms.txt
+
+> LLM-readable manifest following the https://llmstxt.org spec. What we are, who we serve, what we do, and how we price it — in plain text for AI agents and answer engines.
+
+## Name & positioning
+- Product name: StoreSEO
+- Tagline: SEO meta, alt text and rich-result snippets for every product page
+- Domain: https://storeseo.lxsaihub.com/
+- Language: English (en)
+
+## What it does
+- Paste a product page and a primary keyword and run a real listing-SEO workflow: parse the product, generate a meta title/description + five alt texts + a schema.org/Product blurb, then validate it against eight e-commerce listing rules (title length, description length, keyword guardrails, alt-text count, schema, price/availability, rich-result readiness).
+- Meta title / description generator
+- Five alt-text suggestions
+- Schema.org/Product blurb
+- 8-rule listing validation
+
+## Pricing (USD)
+- **Free** — $0 — 10 pages / mo · watermarked export
+- **Pro** — $19/mo — 300 product pages / mo · audit log · export
+- **Enterprise** — Custom — SSO-ready · BYOK · higher caps · shared rulesets
+- Checkout: https://storeseo.lxsaihub.com/api/checkout?cycle=monthly (monthly) / https://storeseo.lxsaihub.com/api/checkout?cycle=yearly (yearly)
+
+## FAQ (high-signal Q&A for AI citation)
+Q1. Do I need to install anything?
+A1. No. StoreSEO runs in your browser.
+Q2. Is my input kept private?
+A2. We use it only to generate your result and minimize retention. See Security.
+Q3. Does it guarantee compliance / correctness?
+A3. No. It is decision-support; you own the final call. See the honesty note in Security.
+Q4. Can I export the result?
+A4. Yes — JSON and CSV.
+Q5. Is there an API?
+A5. Yes, the web form is backed by a REST endpoint you can call from your pipeline.
+
+## Key pages
+- Home / landing: https://storeseo.lxsaihub.com/
+- This manifest: https://storeseo.lxsaihub.com/llms.txt
+
+## Integration & delivery
+- Web app (Next.js) deployed on Vercel
+- Payments via Waffo Pancake (merchant of record)
+- Analytics via Umami
+
+## Contact
+- Open the app: https://storeseo.lxsaihub.com/
